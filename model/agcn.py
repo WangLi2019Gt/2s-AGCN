@@ -34,8 +34,21 @@ def bn_init(bn, scale):
 
 
 class unit_tcn(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=9, stride=1):
+    def __init__(self, in_channels, out_channels, kernel_size=9, stride=1，t=300,nlocal =False):
         super(unit_tcn, self).__init__()
+        self.n_local=nlocal
+        self.inter_channels=t//2
+        self.g=nn.Conv2d(in_channels=t, out_channels=inter_channels, 1)
+        self.phi=nn.Conv2d(in_channels=t, out_channels=inter_channels, 1)
+        self.theta=nn.Conv2d(in_channels=t, out_channels=inter_channels, 1)
+        self.W = nn.Sequential(
+                nn.Conv2d(in_channels=self.inter_channels, out_channels=in_channels,
+                        kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(in_channels)
+            )
+        nn.init.constant(self.W[1].weight, 0)
+        nn.init.constant(self.W[1].bias, 0)
+        
         pad = int((kernel_size - 1) / 2)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=(kernel_size, 1), padding=(pad, 0),
                               stride=(stride, 1))
@@ -43,10 +56,25 @@ class unit_tcn(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU()
         conv_init(self.conv)
+     
         bn_init(self.bn, 1)
 
     def forward(self, x):
+        N, C, T, V = x.size()
+        g_x=x
+        g_x=self.g(g_x.permute(0, 2, 1, 3).contiguous()).view(N, self.inter_channels,C*V)
+        theta_x=x
+        theta_x=self.theta(theta_x.permute(0, 2, 1, 3).contiguous()).view(N, self.inter_channels,C*V)
+        phi_x=x
+        phi_x=self.phi(phi_x.permute(0, 2, 1, 3).contiguous()).view(N,C*V, self.inter_channels)
+        f = torch.matmul(theta_x, phi_x)
+        f_div_C = f /f.size(-1)
+        y = torch.matmul(f_div_C, g_x)
+        y = y.view(N, self.inter_channels,C,V)
+        W_y=self.W(y).permute(0, 2, 1, 3)
+        x = W_y+x
         x = self.bn(self.conv(x))
+        
         return x
 
 
