@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 
-
+B=np.identity(25)#init B or PA
+B=np.stack((B,B,B),0)
 def import_class(name):
     components = name.split('.')
     mod = __import__(components[0])
@@ -72,28 +73,29 @@ class unit_tcn(nn.Module):
         y = torch.matmul(f_div_C, g_x)
         y = y.view(N, self.inter_channels,C,V)
         W_y=self.W(y).permute(0, 2, 1, 3)
-        x = W_y+x
+        x =W_y+x
         x = self.bn(self.conv(x))
         
         return x
 
 
 class unit_gcn(nn.Module):
-    def __init__(self, in_channels, out_channels, A, coff_embedding=4, num_subset=3):
+    def __init__(self, in_channels, out_channels, A, coff_embedding=4, num_subset=3,TL=300):
         super(unit_gcn, self).__init__()
         inter_channels = out_channels // coff_embedding
         self.inter_c = inter_channels
-        self.PA = nn.Parameter(torch.from_numpy(A.astype(np.float32)))
+        self.T_l=TL
+        self.PA = nn.Parameter(torch.from_numpy(B.astype(np.float32)))
         nn.init.constant_(self.PA, 1e-6)
         self.A = Variable(torch.from_numpy(A.astype(np.float32)), requires_grad=False)
         self.num_subset = num_subset
 
         self.conv_a = nn.ModuleList()
-        self.conv_b = nn.ModuleList()
+        self.linear_b = nn.ModuleList()
         self.conv_d = nn.ModuleList()
         for i in range(self.num_subset):
             self.conv_a.append(nn.Conv2d(in_channels, inter_channels, 1))
-            self.conv_b.append(nn.Conv2d(in_channels, inter_channels, 1))
+            self.linear_b.append(nn.Linear(2*inter_channels*TL, 1, bias=False))
             self.conv_d.append(nn.Conv2d(in_channels, out_channels, 1))
 
         if in_channels != out_channels:
@@ -107,7 +109,8 @@ class unit_gcn(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels)
         self.soft = nn.Softmax(-2)
         self.relu = nn.ReLU()
-
+        self.leakyrelu = nn.LeakyReLU(0.2,inplace=True)
+        
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 conv_init(m)
@@ -119,14 +122,15 @@ class unit_gcn(nn.Module):
 
     def forward(self, x):
         N, C, T, V = x.size()
+        assert self.T_l==T
         A = self.A.cuda(x.get_device())
-        A = A + self.PA
+        A = A * self.PA
 
         y = None
         for i in range(self.num_subset):
-            A1 = self.conv_a[i](x).permute(0, 3, 1, 2).contiguous().view(N, V, self.inter_c * T)
-            A2 = self.conv_b[i](x).view(N, self.inter_c * T, V)
-            A1 = self.soft(torch.matmul(A1, A2) / A1.size(-1))  # N V V
+            A1 = self.conv_a[i](x).permute(0, 3, 1, 2).contiguous().view(N, V,self.inter_c * T)
+            A1 = torch.cat([A1.repeat(1,1,V).view(N,V * V, -1),A1.repeat(1,V, 1)], dim=2).view(N, V,V,2*self.inter_c * T)
+            A1 = self.leakyrelu(self.linear_b[i](A1 ).squeeze(3))
             A1 = A1 + A[i]
             A2 = x.view(N, C * T, V)
             z = self.conv_d[i](torch.matmul(A2, A1).view(N, C, T, V))
@@ -138,9 +142,9 @@ class unit_gcn(nn.Module):
 
 
 class TCN_GCN_unit(nn.Module):
-    def __init__(self, in_channels, out_channels, A, stride=1, residual=True):
+    def __init__(self, in_channels, out_channels, A, stride=1, residual=True,t=300):
         super(TCN_GCN_unit, self).__init__()
-        self.gcn1 = unit_gcn(in_channels, out_channels, A)
+        self.gcn1 = unit_gcn(in_channels, out_channels, A,TL=t)
         self.tcn1 = unit_tcn(out_channels, out_channels, stride=stride)
         self.relu = nn.ReLU()
         if not residual:
@@ -170,16 +174,16 @@ class Model(nn.Module):
         A = self.graph.A
         self.data_bn = nn.BatchNorm1d(num_person * in_channels * num_point)
 
-        self.l1 = TCN_GCN_unit(3, 64, A, residual=False)
+        self.l1 = TCN_GCN_unit(3, 64, A, residual=False,)
         self.l2 = TCN_GCN_unit(64, 64, A)
         self.l3 = TCN_GCN_unit(64, 64, A)
         self.l4 = TCN_GCN_unit(64, 64, A)
         self.l5 = TCN_GCN_unit(64, 128, A, stride=2)
-        self.l6 = TCN_GCN_unit(128, 128, A)
-        self.l7 = TCN_GCN_unit(128, 128, A)
-        self.l8 = TCN_GCN_unit(128, 256, A, stride=2)
-        self.l9 = TCN_GCN_unit(256, 256, A)
-        self.l10 = TCN_GCN_unit(256, 256, A)
+        self.l6 = TCN_GCN_unit(128, 128, A,t=150)
+        self.l7 = TCN_GCN_unit(128, 128, A,t=150)
+        self.l8 = TCN_GCN_unit(128, 256, A, stride=2,t=150)
+        self.l9 = TCN_GCN_unit(256, 256, A,t=75)
+        self.l10 = TCN_GCN_unit(256, 256, A,t=75)
 
         self.fc = nn.Linear(256, num_class)
         nn.init.normal_(self.fc.weight, 0, math.sqrt(2. / num_class))
